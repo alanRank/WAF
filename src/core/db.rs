@@ -243,6 +243,21 @@ impl Database {
         Ok(logs)
     }
 
+    pub async fn list_all_attack_logs(&self) -> Result<Vec<AttackLog>> {
+        let logs = sqlx::query_as::<_, AttackLog>(
+            r#"
+            SELECT id, timestamp, source_ip, request_method, request_url, matched_rule_id, attack_type, payload, action_taken
+            FROM attack_logs
+            ORDER BY timestamp DESC, id DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list all attack logs")?;
+
+        Ok(logs)
+    }
+
     pub async fn get_attack_log(&self, id: i64) -> Result<Option<AttackLog>> {
         let log = sqlx::query_as::<_, AttackLog>(
             r#"

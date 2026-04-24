@@ -171,11 +171,24 @@ async fn list_attack_logs(
     State(state): State<AdminApiState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<crate::core::models::AttackLog>>, ApiError> {
-    let limit = params
-        .get("limit")
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(100);
-    let logs = state.db.list_attack_logs(limit).await.map_err(ApiError::internal)?;
+    let logs = match params.get("limit").map(String::as_str) {
+        Some("all") => state
+            .db
+            .list_all_attack_logs()
+            .await
+            .map_err(ApiError::internal)?,
+        _ => {
+            let limit = params
+                .get("limit")
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(100);
+            state
+                .db
+                .list_attack_logs(limit)
+                .await
+                .map_err(ApiError::internal)?
+        }
+    };
     Ok(Json(logs))
 }
 

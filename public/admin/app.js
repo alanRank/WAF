@@ -1,3 +1,8 @@
+const DASHBOARD_LOG_LIMIT = "all";
+const TIMELINE_STEP_SECONDS = 10;
+const TIMELINE_BUCKETS = 18;
+const LIVE_REFRESH_MS = 2000;
+
 const state = {
   token: localStorage.getItem("waf_token") || "",
   activeTab: "overview",
@@ -10,7 +15,9 @@ const state = {
   charts: {
     distribution: null,
     timeline: null
-  }
+  },
+  liveRefreshTimer: null,
+  liveRefreshInFlight: false
 };
 
 const authView = document.getElementById("auth-view");
@@ -45,7 +52,7 @@ async function bootstrap() {
   try {
     await refreshAll();
     showDashboard();
-  } catch (error) {
+  } catch {
     logout();
   }
 }
@@ -66,7 +73,7 @@ async function onLogin(event) {
 
     const payload = await response.json();
     if (!response.ok) {
-      throw new Error(payload?.error || "Authentication failed");
+      throw new Error(payload?.error || "Ошибка авторизации");
     }
 
     state.token = payload.access_token;
@@ -82,6 +89,7 @@ async function onLogin(event) {
 function logout() {
   localStorage.removeItem("waf_token");
   state.token = "";
+  stopLiveRefresh();
   showAuth();
 }
 
@@ -90,7 +98,7 @@ async function refreshAll() {
     api("/api/admin/config"),
     api("/api/admin/rules"),
     api("/api/admin/security-policies"),
-    api("/api/admin/logs?limit=50"),
+    api(`/api/admin/logs?limit=${DASHBOARD_LOG_LIMIT}`),
     api("/api/admin/ip-lists"),
     api("/api/admin/users")
   ]);
@@ -109,6 +117,52 @@ async function refreshAll() {
   renderEditors();
   fillConfigForm();
   showStatus("Данные обновлены", false, true);
+}
+
+async function refreshLiveData() {
+  if (!state.token || state.liveRefreshInFlight) {
+    return;
+  }
+
+  state.liveRefreshInFlight = true;
+
+  try {
+    const [config, logs] = await Promise.all([
+      api("/api/admin/config"),
+      api(`/api/admin/logs?limit=${DASHBOARD_LOG_LIMIT}`)
+    ]);
+
+    state.config = config;
+    state.logs = logs;
+
+    renderDashboard();
+
+    if (state.activeTab === "logs") {
+      renderLogs();
+    }
+
+    if (state.activeTab === "settings") {
+      fillConfigForm();
+    }
+  } catch (error) {
+    console.error("Live refresh failed", error);
+  } finally {
+    state.liveRefreshInFlight = false;
+  }
+}
+
+function startLiveRefresh() {
+  stopLiveRefresh();
+  state.liveRefreshTimer = window.setInterval(() => {
+    refreshLiveData();
+  }, LIVE_REFRESH_MS);
+}
+
+function stopLiveRefresh() {
+  if (state.liveRefreshTimer) {
+    window.clearInterval(state.liveRefreshTimer);
+    state.liveRefreshTimer = null;
+  }
 }
 
 function activateTab(name) {
@@ -165,6 +219,7 @@ async function saveRules() {
       body: JSON.stringify(payload)
     });
     renderEditors();
+    renderDashboard();
     showStatus("rules.json обновлен", false);
   } catch (error) {
     showStatus(error.message, true);
@@ -174,6 +229,7 @@ async function saveRules() {
 async function reloadRules() {
   state.rules = await api("/api/admin/rules");
   renderEditors();
+  renderDashboard();
   showStatus("rules.json загружен", false);
 }
 
@@ -200,6 +256,7 @@ async function reloadPolicies() {
 
 async function upsertIpEntry(event) {
   event.preventDefault();
+
   const payload = {
     ip_address: document.getElementById("ip-address").value.trim(),
     list_type: document.getElementById("ip-list-type").value,
@@ -218,11 +275,12 @@ async function upsertIpEntry(event) {
   state.ipEntries = await api("/api/admin/ip-lists");
   renderIpEntries();
   renderDashboard();
-  showStatus("IP entry сохранен", false);
+  showStatus("IP-запись сохранена", false);
 }
 
 async function createUser(event) {
   event.preventDefault();
+
   const payload = {
     username: document.getElementById("new-username").value.trim(),
     password: document.getElementById("new-password").value,
@@ -294,7 +352,7 @@ async function clearLogs() {
   }
 
   await api("/api/admin/logs/clear", { method: "POST" });
-  state.logs = await api("/api/admin/logs?limit=50");
+  state.logs = await api(`/api/admin/logs?limit=${DASHBOARD_LOG_LIMIT}`);
   renderLogs();
   renderDashboard();
   showStatus("Журнал атак очищен", false);
@@ -302,7 +360,7 @@ async function clearLogs() {
 
 async function deleteLog(id) {
   await api(`/api/admin/logs/${id}`, { method: "DELETE" });
-  state.logs = await api("/api/admin/logs?limit=50");
+  state.logs = await api(`/api/admin/logs?limit=${DASHBOARD_LOG_LIMIT}`);
   renderLogs();
   renderDashboard();
   showStatus(`Лог #${id} удален`, false);
@@ -317,7 +375,7 @@ function renderDashboard() {
   document.getElementById("logs-count").textContent = String(state.logs.length);
 
   renderRecentActions();
-  renderVectorStats();
+  renderTopRules();
   renderDistributionChart();
   renderTimelineChart();
 }
@@ -325,14 +383,13 @@ function renderDashboard() {
 function renderRecentActions() {
   const node = document.getElementById("recent-actions");
   const items = state.logs
-    .filter((log) => toAttackVector(log.attack_type))
-    .slice(0, 8)
+    .slice(0, 3)
     .map((log) => `
       <div class="event-row">
         <div class="flex items-start justify-between gap-3">
           <div>
             <div class="text-sm font-semibold text-bark">${escapeHtml(log.source_ip)} - ${escapeHtml(log.action_taken)}</div>
-            <div class="mt-1 text-sm text-bark/70">${escapeHtml(shortReason(log))}</div>
+            <div class="mt-1 text-sm text-bark/70">${escapeHtml(buildEventSummary(log))}</div>
           </div>
           <div class="text-xs text-bark/45">${escapeHtml(log.timestamp)}</div>
         </div>
@@ -340,27 +397,26 @@ function renderRecentActions() {
     `)
     .join("");
 
-  node.innerHTML = items || `<div class="event-row text-sm text-bark/60">Событий по трем основным векторам пока нет.</div>`;
+  node.innerHTML = items || `<div class="event-row text-sm text-bark/60">События атак пока не зарегистрированы.</div>`;
 }
 
-function renderVectorStats() {
-  const vectors = aggregateVectors();
-  const items = [
-    ["SQL инъекция", vectors.sql],
-    ["XSS инъекция", vectors.xss],
-    ["Path-traversal", vectors.path]
-  ].map(([label, value]) => `
-    <div class="summary-pill">
-      <span>${label}</span>
-      <strong>${value}</strong>
-    </div>
-  `).join("");
+function renderTopRules() {
+  const topRules = getTopRules();
+  const items = topRules
+    .map((item) => `
+      <div class="summary-pill">
+        <span>${escapeHtml(item.label)}</span>
+        <strong>${item.count}</strong>
+      </div>
+    `)
+    .join("");
 
-  document.getElementById("vector-stats").innerHTML = items;
+  document.getElementById("vector-stats").innerHTML =
+    items || `<div class="summary-pill"><span>Нет сигнатурных срабатываний</span><strong>0</strong></div>`;
 }
 
 function renderDistributionChart() {
-  const vectors = aggregateVectors();
+  const topRules = getTopRules();
   const ctx = document.getElementById("distribution-chart");
 
   if (state.charts.distribution) {
@@ -370,11 +426,15 @@ function renderDistributionChart() {
   state.charts.distribution = new Chart(ctx, {
     type: "doughnut",
     data: {
-      labels: ["SQL инъекция", "XSS инъекция", "Path-traversal"],
+      labels: topRules.length ? topRules.map((item) => item.label) : ["Нет данных"],
       datasets: [{
-        data: [vectors.sql, vectors.xss, vectors.path],
-        backgroundColor: ["#8fd14f", "#4ea63b", "#2f7c29"],
-        borderWidth: 0
+        data: topRules.length ? topRules.map((item) => item.count) : [1],
+        backgroundColor: topRules.length
+          ? ["#9aa3ff", "#6f79f1", "#4b56cb"]
+          : ["#d8dcff"],
+        borderColor: "#ffffff",
+        borderWidth: 3,
+        hoverOffset: 8
       }]
     },
     options: {
@@ -382,7 +442,10 @@ function renderDistributionChart() {
       plugins: {
         legend: {
           position: "bottom",
-          labels: { color: "#1d331c", usePointStyle: true }
+          labels: {
+            color: "#252b5c",
+            usePointStyle: true
+          }
         }
       }
     }
@@ -390,17 +453,28 @@ function renderDistributionChart() {
 }
 
 function renderTimelineChart() {
-  const filtered = state.logs
-    .filter((log) => toAttackVector(log.attack_type))
-    .slice()
-    .reverse();
+  const stepMs = TIMELINE_STEP_SECONDS * 1000;
+  const now = Date.now();
+  const bucketEnd = Math.floor(now / stepMs) * stepMs;
+  const windowStart = bucketEnd - (TIMELINE_BUCKETS - 1) * stepMs;
+  const labels = [];
+  const counts = Array.from({ length: TIMELINE_BUCKETS }, () => 0);
 
-  const labels = filtered.map((log) => formatTime(log.timestamp));
-  const cumulative = [];
-  let total = 0;
-  filtered.forEach(() => {
-    total += 1;
-    cumulative.push(total);
+  for (let index = 0; index < TIMELINE_BUCKETS; index += 1) {
+    labels.push(formatTime(windowStart + index * stepMs));
+  }
+
+  state.logs.forEach((log) => {
+    const timestamp = parseLogTimestamp(log.timestamp);
+    if (Number.isNaN(timestamp) || timestamp < windowStart || timestamp >= bucketEnd + stepMs) {
+      return;
+    }
+
+    const bucketIndex = Math.min(
+      TIMELINE_BUCKETS - 1,
+      Math.floor((timestamp - windowStart) / stepMs)
+    );
+    counts[bucketIndex] += 1;
   });
 
   const ctx = document.getElementById("timeline-chart");
@@ -413,41 +487,55 @@ function renderTimelineChart() {
     data: {
       labels,
       datasets: [{
-        label: "Атаки",
-        data: cumulative,
-        borderColor: "#4ea63b",
-        backgroundColor: "rgba(143,209,79,0.18)",
-        tension: 0.32,
+        label: "Атаки / 10 сек",
+        data: counts,
+        borderColor: "#6f79f1",
+        backgroundColor: "rgba(154,163,255,0.22)",
+        stepped: true,
         fill: true,
         pointRadius: 3,
-        pointBackgroundColor: "#2f7c29"
+        pointHoverRadius: 5,
+        pointBackgroundColor: "#4b56cb",
+        pointBorderColor: "#ffffff",
+        pointBorderWidth: 2
       }]
     },
     options: {
       maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false }
+      },
       scales: {
-        x: { ticks: { color: "#365335" }, grid: { color: "rgba(78,166,59,0.08)" } },
-        y: { ticks: { color: "#365335", precision: 0 }, grid: { color: "rgba(78,166,59,0.08)" } }
+        x: {
+          ticks: { color: "#5d66d6" },
+          grid: { color: "rgba(102,112,232,0.08)" }
+        },
+        y: {
+          beginAtZero: true,
+          ticks: { color: "#5d66d6", precision: 0, stepSize: 1 },
+          grid: { color: "rgba(102,112,232,0.08)" }
+        }
       }
     }
   });
 }
 
 function renderLogs() {
-  const rows = state.logs.map((log) => `
-    <tr>
-      <td class="text-xs text-bark/70">${escapeHtml(log.timestamp)}</td>
-      <td class="text-sm">${escapeHtml(log.source_ip)}</td>
-      <td class="text-sm">${escapeHtml(log.request_url || "-")}</td>
-      <td class="text-sm">${escapeHtml(log.attack_type || "-")}</td>
-      <td class="text-sm">${escapeHtml(log.action_taken)}</td>
-      <td class="text-xs text-bark/70">${escapeHtml(extractMessage(log.payload))}</td>
-      <td class="text-right">
-        <button class="secondary-btn !py-2 !px-3" onclick="deleteLog(${log.id})">Удалить</button>
-      </td>
-    </tr>
-  `).join("");
+  const rows = state.logs
+    .map((log) => `
+      <tr>
+        <td class="text-xs text-bark/70">${escapeHtml(log.timestamp)}</td>
+        <td class="text-sm">${escapeHtml(log.source_ip)}</td>
+        <td class="text-sm">${escapeHtml(log.request_url || "-")}</td>
+        <td class="text-sm">${escapeHtml(log.attack_type || "-")}</td>
+        <td class="text-sm">${escapeHtml(log.action_taken)}</td>
+        <td class="text-xs text-bark/70">${escapeHtml(extractMessage(log.payload))}</td>
+        <td class="text-right">
+          <button class="secondary-btn !py-2 !px-3" onclick="deleteLog(${log.id})">Удалить</button>
+        </td>
+      </tr>
+    `)
+    .join("");
 
   document.getElementById("logs-table").innerHTML = wrapTable(
     ["Время", "IP", "URL", "Тип", "Действие", "Причина", ""],
@@ -456,17 +544,19 @@ function renderLogs() {
 }
 
 function renderIpEntries() {
-  const rows = state.ipEntries.map((entry) => `
-    <tr>
-      <td>${escapeHtml(entry.ip_address)}</td>
-      <td>${escapeHtml(entry.list_type)}</td>
-      <td>${escapeHtml(entry.comment || "-")}</td>
-      <td class="text-xs text-bark/60">${escapeHtml(entry.created_at)}</td>
-      <td class="text-right">
-        <button class="secondary-btn !py-2 !px-3" onclick="deleteIp('${escapeJs(entry.ip_address)}')">Удалить</button>
-      </td>
-    </tr>
-  `).join("");
+  const rows = state.ipEntries
+    .map((entry) => `
+      <tr>
+        <td>${escapeHtml(entry.ip_address)}</td>
+        <td>${escapeHtml(entry.list_type)}</td>
+        <td>${escapeHtml(entry.comment || "-")}</td>
+        <td class="text-xs text-bark/60">${escapeHtml(entry.created_at)}</td>
+        <td class="text-right">
+          <button class="secondary-btn !py-2 !px-3" onclick="deleteIp('${escapeJs(entry.ip_address)}')">Удалить</button>
+        </td>
+      </tr>
+    `)
+    .join("");
 
   document.getElementById("ip-table").innerHTML = wrapTable(
     ["IP", "List", "Comment", "Created", ""],
@@ -475,17 +565,19 @@ function renderIpEntries() {
 }
 
 function renderUsers() {
-  const rows = state.users.map((user) => `
-    <tr>
-      <td>${escapeHtml(user.username)}</td>
-      <td>${escapeHtml(user.role)}</td>
-      <td class="text-xs text-bark/60">${escapeHtml(user.created_at)}</td>
-      <td class="text-right space-x-2">
-        <button class="secondary-btn !py-2 !px-3" onclick="updateUser('${escapeJs(user.username)}')">Изменить</button>
-        <button class="secondary-btn !py-2 !px-3" onclick="deleteUser('${escapeJs(user.username)}')">Удалить</button>
-      </td>
-    </tr>
-  `).join("");
+  const rows = state.users
+    .map((user) => `
+      <tr>
+        <td>${escapeHtml(user.username)}</td>
+        <td>${escapeHtml(user.role)}</td>
+        <td class="text-xs text-bark/60">${escapeHtml(user.created_at)}</td>
+        <td class="text-right space-x-2">
+          <button class="secondary-btn !py-2 !px-3" onclick="updateUser('${escapeJs(user.username)}')">Изменить</button>
+          <button class="secondary-btn !py-2 !px-3" onclick="deleteUser('${escapeJs(user.username)}')">Удалить</button>
+        </td>
+      </tr>
+    `)
+    .join("");
 
   document.getElementById("users-table").innerHTML = wrapTable(
     ["Username", "Role", "Created", ""],
@@ -509,27 +601,37 @@ function fillConfigForm() {
   document.getElementById("cfg-key-path").value = state.config.tls_key_path;
 }
 
-function aggregateVectors() {
-  const result = { sql: 0, xss: 0, path: 0 };
+function getTopRules() {
+  const counts = new Map();
+
   state.logs.forEach((log) => {
-    const vector = toAttackVector(log.attack_type);
-    if (vector) {
-      result[vector] += 1;
+    if (!log.matched_rule_id) {
+      return;
     }
+
+    counts.set(log.matched_rule_id, (counts.get(log.matched_rule_id) || 0) + 1);
   });
-  return result;
+
+  return Array.from(counts.entries())
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 3)
+    .map(([ruleId, count]) => ({
+      ruleId,
+      count,
+      label: buildRuleLabel(ruleId)
+    }));
 }
 
-function toAttackVector(attackType) {
-  const value = String(attackType || "").toLowerCase();
-  if (value.includes("sql")) return "sql";
-  if (value.includes("xss")) return "xss";
-  if (value.includes("path")) return "path";
-  return null;
+function buildRuleLabel(ruleId) {
+  const rule = state.rules.find((item) => item.id === ruleId);
+  return rule ? `${ruleId} - ${rule.name}` : ruleId;
 }
 
-function shortReason(log) {
-  return `${log.source_ip} - ${extractMessage(log.payload)}`;
+function buildEventSummary(log) {
+  const attackName = log.attack_type || "Неизвестная атака";
+  const ruleId = log.matched_rule_id ? `, rule ${log.matched_rule_id}` : "";
+  const reason = extractMessage(log.payload);
+  return `${attackName}${ruleId}; ${reason}`;
 }
 
 function extractMessage(payload) {
@@ -542,8 +644,26 @@ function extractMessage(payload) {
 }
 
 function formatTime(value) {
-  const date = new Date(value);
+  const date = new Date(typeof value === "number" ? value : parseLogTimestamp(value));
   return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString();
+}
+
+function parseLogTimestamp(value) {
+  if (!value) {
+    return Number.NaN;
+  }
+
+  if (typeof value === "number") {
+    return value;
+  }
+
+  const normalized = String(value).trim();
+  const hasExplicitTimezone = /[zZ]|[+\-]\d{2}:\d{2}$/.test(normalized);
+  if (hasExplicitTimezone) {
+    return Date.parse(normalized);
+  }
+
+  return Date.parse(`${normalized.replace(" ", "T")}Z`);
 }
 
 function showStatus(message, isError = false, transient = false) {
@@ -559,6 +679,7 @@ function showStatus(message, isError = false, transient = false) {
 }
 
 function showAuth() {
+  stopLiveRefresh();
   dashboardView.classList.add("hidden");
   authView.classList.remove("hidden");
 }
@@ -567,6 +688,7 @@ function showDashboard() {
   authView.classList.add("hidden");
   dashboardView.classList.remove("hidden");
   activateTab(state.activeTab);
+  startLiveRefresh();
 }
 
 async function api(url, options = {}) {
@@ -595,7 +717,7 @@ function wrapTable(headers, rows) {
   return `
     <div class="table-wrap overflow-x-auto">
       <table>
-        <thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead>
+        <thead><tr>${headers.map((header) => `<th>${header}</th>`).join("")}</tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
@@ -611,7 +733,7 @@ function escapeHtml(value) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
+    .replaceAll("\"", "&quot;")
     .replaceAll("'", "&#39;");
 }
 
