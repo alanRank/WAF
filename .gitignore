@@ -1,0 +1,6 @@
+target/
+**/*.rs.bk
+data/waf.db
+.env
+Мастер промт.md
+data/certs/*.pem

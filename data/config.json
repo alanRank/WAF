@@ -1,0 +1,10 @@
+{
+  "mode": "active",
+  "is_enabled": true,
+  "target_url": "http://localhost:3000",
+  "admin_port": 8081,
+  "interceptor_port": 443,
+  "interceptor_host": "0.0.0.0",
+  "tls_cert_path": "data/certs/waf.local.pem",
+  "tls_key_path": "data/certs/waf.local-key.pem"
+}

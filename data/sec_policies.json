@@ -1,0 +1,114 @@
+{
+  "global_defaults": {
+    "allowed_methods": [
+      "GET",
+      "POST"
+    ],
+    "allowed_headers": [
+      "Content-Type",
+      "Authorization",
+      "User-Agent",
+      "Accept",
+      "Accept-Language",
+      "Accept-Encoding",
+      "Origin",
+      "Referer",
+      "DNT",
+      "Sec-GPC",
+      "Cache-Control",
+      "Pragma",
+      "Cookie",
+      "X-Requested-With",
+      "Sec-Fetch-Site",
+      "Sec-Fetch-Mode",
+      "Sec-Fetch-Dest",
+      "Sec-Fetch-User",
+      "Sec-CH-UA",
+      "Sec-CH-UA-Mobile",
+      "Sec-CH-UA-Platform",
+      "Upgrade-Insecure-Requests",
+      "If-None-Match"
+    ],
+    "max_body_size_kb": 1024
+  },
+  "endpoints": {
+    "/ftp": {
+      "allowed_methods": [
+        "GET"
+      ],
+      "allowed_headers": [
+        "Range"
+      ],
+      "mandatory_headers": [],
+      "max_body_size_kb": null,
+      "max_params": null,
+      "description": "Public files endpoint with read-only access"
+    },
+    "/rest/products/search": {
+      "allowed_methods": [
+        "GET"
+      ],
+      "allowed_headers": [
+        "Content-Type",
+        "Authorization",
+        "User-Agent",
+        "Accept",
+        "Accept-Language",
+        "Accept-Encoding",
+        "Origin",
+        "Referer",
+        "DNT",
+        "Sec-GPC",
+        "Cache-Control",
+        "Pragma",
+        "Cookie",
+        "X-Requested-With",
+        "Sec-Fetch-Site",
+        "Sec-Fetch-Mode",
+        "Sec-Fetch-Dest",
+        "Sec-Fetch-User",
+        "Sec-CH-UA",
+        "Sec-CH-UA-Mobile",
+        "Sec-CH-UA-Platform"
+      ],
+      "mandatory_headers": [],
+      "max_body_size_kb": null,
+      "max_params": 3,
+      "description": "Product search endpoint with limited query parameters"
+    },
+    "/api/Users/login": {
+      "allowed_methods": [
+        "POST"
+      ],
+      "allowed_headers": [
+        "Content-Type",
+        "Authorization",
+        "User-Agent",
+        "Accept",
+        "Accept-Language",
+        "Accept-Encoding",
+        "Origin",
+        "Referer",
+        "DNT",
+        "Sec-GPC",
+        "Cache-Control",
+        "Pragma",
+        "Cookie",
+        "X-Requested-With",
+        "Sec-Fetch-Site",
+        "Sec-Fetch-Mode",
+        "Sec-Fetch-Dest",
+        "Sec-Fetch-User",
+        "Sec-CH-UA",
+        "Sec-CH-UA-Mobile",
+        "Sec-CH-UA-Platform"
+      ],
+      "mandatory_headers": [
+        "Content-Type"
+      ],
+      "max_body_size_kb": 2,
+      "max_params": null,
+      "description": "Login endpoint with strict body size limit"
+    }
+  }
+}

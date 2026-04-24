@@ -1,0 +1,32 @@
+[
+  {
+    "id": "942100",
+    "name": "SQL Injection Attack",
+    "regex": "(?i)(union|select|insert|update|delete|drop).+(from|into|table|where)",
+    "severity": "critical"
+  },
+  {
+    "id": "942200",
+    "name": "SQL Injection Attack OR 1=1",
+    "regex": "(?i)\\bOR\\b\\s+(?:'[^']+'|\"[^\"]+\"|\\d+)\\s*=\\s*(?:'[^']+'|\"[^\"]+\"|\\d+)",
+    "severity": "critical"
+  },
+  {
+    "id": "941100",
+    "name": "XSS Detection",
+    "regex": "(?i)<script.*?>|javascript:|on\\w+\\s*=",
+    "severity": "high"
+  },
+  {
+    "id": "930100",
+    "name": "Path Traversal Detection",
+    "regex": "(?i)(\\.\\./|%2e%2e%2f|%252e%252e%252f)",
+    "severity": "high"
+  },
+  {
+    "id": "990100",
+    "name": "Path Traversal Detection",
+    "regex": "(?i)(\\.\\./|%2e%2e%2f|%252e%252e%252f)",
+    "severity": "high"
+  }
+]
