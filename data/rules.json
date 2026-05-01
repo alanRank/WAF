@@ -28,5 +28,137 @@
     "name": "Path Traversal Detection",
     "regex": "(?i)(\\.\\./|%2e%2e%2f|%252e%252e%252f)",
     "severity": "high"
+  },
+  {
+    "id": "942300",
+    "name": "Blind Logic SQLi",
+    "regex": "(?i)\\b(?:AND|OR)\\b\\s*\\(?\\s*SELECT\\s+(?:SUBSTRING|MID|LEFT|RIGHT|ASCII|CHAR)",
+    "severity": "critical"
+  },
+  {
+    "id": "942400",
+    "name": "Time-based Blind SQLi",
+    "regex": "(?i)\\b(?:SLEEP\\s*\\(|BENCHMARK\\s*\\(|pg_sleep\\s*\\(|WAITFOR\\s+DELAY\\b)",
+    "severity": "critical"
+  },
+  {
+    "id": "942500",
+    "name": "Error-based SQLi",
+    "regex": "(?i)(?:COUNT\\s*\\(\\s*\\*\\s*\\)\\s+FROM.+GROUP\\s+BY.+CONCAT|EXTRACTVALUE\\s*\\(|UPDATEXML\\s*\\()",
+    "severity": "critical"
+  },
+  {
+    "id": "942600",
+    "name": "Stacked Queries SQLi",
+    "regex": "(?i);\\s*(?:DROP|DELETE|UPDATE|INSERT|TRUNCATE|GRANT|REVOKE|ALTER)\\b",
+    "severity": "critical"
+  },
+  {
+    "id": "942700",
+    "name": "Hex Encoding Bypass SQLi",
+    "regex": "(?i)\\b(?:SELECT|UNION|AND|OR|WHERE|=)\\b.*?0x[0-9a-fA-F]+\\b",
+    "severity": "high"
+  },
+  {
+    "id": "942800",
+    "name": "SQL Comment Termination (Often in Headers)",
+    "regex": "(?i)['\"]\\s*(?:--|#|/\\*)",
+    "severity": "high"
+  },
+  {
+    "id": "942900",
+    "name": "Second-Order / Concatenation SQLi",
+    "regex": "(?i)(?:\\+|\\|\\|)\\s*\\(\\s*SELECT\\b",
+    "severity": "critical"
+  },
+  {
+    "id": "943000",
+    "name": "Inline Comment Obfuscation SQLi",
+    "regex": "(?i)[a-z]+/\\*(?:.|\\n)*?\\*/[a-z]+",
+    "severity": "high"
+  },
+  {
+    "id": "941110",
+    "name": "XSS Classic Alert/Prompt",
+    "regex": "(?i)<script\\b[^>]*>[\\s\\S]*?(?:alert|prompt|confirm)\\s*\\(",
+    "severity": "critical"
+  },
+  {
+    "id": "941120",
+    "name": "XSS Cookie Theft",
+    "regex": "(?i)document\\\\.cookie",
+    "severity": "critical"
+  },
+  {
+    "id": "941130",
+    "name": "XSS Event Handler (img/svg/etc)",
+    "regex": "(?i)<(?:img|svg|body|iframe|object|input|a|details)[^>]+on[a-z]+\\\\s*=",
+    "severity": "critical"
+  },
+  {
+    "id": "941140",
+    "name": "XSS Phishing Form Injection",
+    "regex": "(?i)<form[^>]+action\\\\s*=\\\\s*['\\\"]?(?:https?:)?//",
+    "severity": "high"
+  },
+  {
+    "id": "941150",
+    "name": "XSS DOM Redirect",
+    "regex": "(?i)(?:window\\\\.)?location(?:\\\\.href|\\\\.replace)?\\\\s*=",
+    "severity": "critical"
+  },
+  {
+    "id": "941160",
+    "name": "XSS External Script Loading",
+    "regex": "(?i)<script[^>]+src\\\\s*=\\\\s*['\\\"]?(?:https?:)?//",
+    "severity": "critical"
+  },
+  {
+    "id": "941170",
+    "name": "XSS CSS Expression",
+    "regex": "(?i)style\\s*=\\s*['\"]?[^'\"]*expression\\s*\\(",
+    "severity": "medium"
+  },
+  {
+    "id": "931110",
+    "name": "Path Traversal (Classic Linux)",
+    "regex": "(?i)(?:\\.\\./){2,}",
+    "severity": "critical"
+  },
+  {
+    "id": "931120",
+    "name": "Path Traversal (Windows)",
+    "regex": "(?i)(?:\\.\\.\\\\){2,}",
+    "severity": "critical"
+  },
+  {
+    "id": "931130",
+    "name": "Path Traversal (Absolute Path Access)",
+    "regex": "(?i)(?:^|=)/+(?:etc/|windows/|boot\\.ini|var/log/|usr/)",
+    "severity": "high"
+  },
+  {
+    "id": "931140",
+    "name": "Path Traversal (Redundant Slashes Bypass)",
+    "regex": "(?i)/{3,}(?:etc|var|usr|windows|boot)",
+    "severity": "high"
+  },
+  {
+    "id": "931150",
+    "name": "Path Traversal (Current Directory Obfuscation)",
+    "regex": "(?i)(?:\\./){3,}",
+    "severity": "medium"
+  },
+  {
+    "id": "931160",
+    "name": "Path Traversal (Null Byte Injection)",
+    "regex": "(?i)%00|\\x00",
+    "severity": "critical"
+  },
+  {
+    "id": "931170",
+    "name": "Local File Inclusion (Parameter-based)",
+    "regex": "(?i)=[^&]*(?:\\.\\./|\\.\\.\\\\)",
+    "severity": "critical"
   }
 ]

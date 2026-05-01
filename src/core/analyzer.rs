@@ -282,3 +282,458 @@ fn build_inspection_target(request: &AnalysisRequest) -> String {
         request.body.as_deref().unwrap_or_default()
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{
+        config::SharedState,
+        models::{
+            AccessListType, Config, GlobalDefaults, NewIpAccessEntry, Rule, Severity,
+        },
+    };
+    use anyhow::Result;
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tokio::sync::RwLock;
+
+    fn test_config(mode: WafMode, is_enabled: bool) -> Config {
+        Config {
+            mode,
+            is_enabled,
+            target_url: "http://localhost:3000".to_string(),
+            admin_port: 8081,
+            interceptor_port: 443,
+            interceptor_host: "0.0.0.0".to_string(),
+            tls_cert_path: "data/certs/test.pem".to_string(),
+            tls_key_path: "data/certs/test-key.pem".to_string(),
+        }
+    }
+
+    fn test_rules() -> Vec<Rule> {
+        vec![
+            Rule {
+                id: "942100".to_string(),
+                name: "SQL Injection Attack".to_string(),
+                regex: "(?i)(union\\s+select|or\\s+1=1)".to_string(),
+                severity: Severity::High,
+            },
+            Rule {
+                id: "941220".to_string(),
+                name: "XSS Attack".to_string(),
+                regex: "(?i)<script|onerror\\s*=".to_string(),
+                severity: Severity::High,
+            },
+        ]
+    }
+
+    fn test_policies() -> SecurityPolicies {
+        let mut endpoints = HashMap::new();
+        endpoints.insert(
+            "/strict".to_string(),
+            EndpointPolicy {
+                allowed_methods: vec!["POST".to_string()],
+                allowed_headers: vec!["X-Trace-Id".to_string()],
+                mandatory_headers: vec!["Content-Type".to_string()],
+                max_body_size_kb: Some(1),
+                max_params: Some(2),
+                description: Some("strict policy".to_string()),
+            },
+        );
+        endpoints.insert(
+            "/defaults".to_string(),
+            EndpointPolicy {
+                allowed_methods: Vec::new(),
+                allowed_headers: vec!["X-Custom".to_string()],
+                mandatory_headers: Vec::new(),
+                max_body_size_kb: None,
+                max_params: None,
+                description: Some("uses global defaults".to_string()),
+            },
+        );
+
+        SecurityPolicies {
+            global_defaults: GlobalDefaults {
+                allowed_methods: vec!["GET".to_string(), "POST".to_string()],
+                allowed_headers: vec![
+                    "User-Agent".to_string(),
+                    "Content-Type".to_string(),
+                    "Accept".to_string(),
+                ],
+                max_body_size_kb: 8,
+            },
+            endpoints,
+        }
+    }
+
+    fn build_request(path: &str) -> AnalysisRequest {
+        AnalysisRequest {
+            source_ip: "203.0.113.10".to_string(),
+            method: "GET".to_string(),
+            path: path.to_string(),
+            query: None,
+            headers: BTreeMap::from([
+                ("User-Agent".to_string(), "curl/8.0".to_string()),
+                ("Accept".to_string(), "application/json".to_string()),
+            ]),
+            body: None,
+        }
+    }
+
+    async fn build_analyzer(mode: WafMode, is_enabled: bool) -> Result<(Analyzer, PathBuf)> {
+        let db_path = unique_test_db_path();
+        let db = Database::connect(&db_path).await?;
+        db.initialize().await?;
+
+        let state = SharedState {
+            config: Arc::new(RwLock::new(test_config(mode, is_enabled))),
+            rules: Arc::new(RwLock::new(test_rules())),
+            security_policies: Arc::new(RwLock::new(test_policies())),
+        };
+
+        Ok((Analyzer::new(db, state), db_path))
+    }
+
+    fn unique_test_db_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rust-waf-analyzer-test-{}-{}.db",
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    fn cleanup_db(path: PathBuf) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn normalize_method_uppercases_and_trims() {
+        assert_eq!(normalize_method(" post "), "POST");
+    }
+
+    #[test]
+    fn normalize_headers_lowercases_names_and_trims_values() {
+        let headers = BTreeMap::from([
+            (" Content-Type ".to_string(), " application/json ".to_string()),
+            ("X-Test".to_string(), " value ".to_string()),
+        ]);
+
+        let normalized = normalize_headers(&headers);
+
+        assert_eq!(
+            normalized.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(normalized.get("x-test").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn implicit_allowed_headers_include_transport_headers() {
+        assert!(is_implicit_allowed_header("host"));
+        assert!(is_implicit_allowed_header("content-length"));
+        assert!(!is_implicit_allowed_header("x-custom"));
+    }
+
+    #[test]
+    fn count_query_params_ignores_empty_segments() {
+        assert_eq!(count_query_params(Some("a=1&&b=2&")), 2);
+        assert_eq!(count_query_params(None), 0);
+    }
+
+    #[test]
+    fn build_inspection_target_includes_method_path_query_and_body() {
+        let request = AnalysisRequest {
+            source_ip: "127.0.0.1".to_string(),
+            method: "POST".to_string(),
+            path: "/login".to_string(),
+            query: Some("q=test".to_string()),
+            headers: BTreeMap::new(),
+            body: Some("<script>alert(1)</script>".to_string()),
+        };
+
+        let target = build_inspection_target(&request);
+
+        assert!(target.contains("POST"));
+        assert!(target.contains("/login"));
+        assert!(target.contains("q=test"));
+        assert!(target.contains("<script>alert(1)</script>"));
+    }
+
+    #[tokio::test]
+    async fn apply_mode_keeps_block_in_active_mode() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let decision = AnalysisDecision {
+            action: DecisionAction::Block,
+            reason: DecisionReason::SignatureMatch,
+            matched_rule_id: Some("942100".to_string()),
+            message: "blocked".to_string(),
+        };
+
+        let applied = analyzer.apply_mode(decision, &WafMode::Active);
+
+        assert_eq!(applied.action, DecisionAction::Block);
+        assert_eq!(applied.reason, DecisionReason::SignatureMatch);
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_mode_converts_block_to_log_in_passive_mode() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Passive, true).await?;
+        let decision = AnalysisDecision {
+            action: DecisionAction::Block,
+            reason: DecisionReason::SignatureMatch,
+            matched_rule_id: Some("942100".to_string()),
+            message: "blocked".to_string(),
+        };
+
+        let applied = analyzer.apply_mode(decision, &WafMode::Passive);
+
+        assert_eq!(applied.action, DecisionAction::Log);
+        assert_eq!(applied.reason, DecisionReason::SignatureMatch);
+        assert_eq!(applied.matched_rule_id.as_deref(), Some("942100"));
+        assert!(applied.message.starts_with("passive mode:"));
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_allows_when_waf_is_disabled() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, false).await?;
+        let request = build_request("/strict");
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.reason, DecisionReason::WafDisabled);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_blocks_blacklisted_ip() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        analyzer
+            .db
+            .upsert_ip_access_entry(&NewIpAccessEntry {
+                ip_address: "203.0.113.10".to_string(),
+                list_type: AccessListType::Black,
+                comment: Some("blocked in test".to_string()),
+                expires_at: None,
+            })
+            .await?;
+
+        let request = build_request("/strict");
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Block);
+        assert_eq!(decision.reason, DecisionReason::IpBlacklist);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_allows_whitelisted_ip_before_other_checks() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        analyzer
+            .db
+            .upsert_ip_access_entry(&NewIpAccessEntry {
+                ip_address: "203.0.113.10".to_string(),
+                list_type: AccessListType::White,
+                comment: Some("allowed in test".to_string()),
+                expires_at: None,
+            })
+            .await?;
+
+        let mut request = build_request("/strict");
+        request.method = "DELETE".to_string();
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.reason, DecisionReason::IpWhitelist);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_blocks_disallowed_method() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let request = build_request("/strict");
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Block);
+        assert_eq!(decision.reason, DecisionReason::MethodNotAllowed);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_blocks_when_mandatory_header_is_missing() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let mut request = build_request("/strict");
+        request.method = "POST".to_string();
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Block);
+        assert_eq!(decision.reason, DecisionReason::MissingMandatoryHeader);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_blocks_unapproved_header() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let mut request = build_request("/strict");
+        request.method = "POST".to_string();
+        request
+            .headers
+            .insert("Content-Type".to_string(), "application/json".to_string());
+        request
+            .headers
+            .insert("X-Blocked".to_string(), "1".to_string());
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Block);
+        assert_eq!(decision.reason, DecisionReason::HeaderNotAllowed);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_allows_endpoint_header_extension_over_global_defaults() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let mut request = build_request("/defaults");
+        request
+            .headers
+            .insert("X-Custom".to_string(), "ok".to_string());
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.reason, DecisionReason::Passed);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_blocks_oversized_body() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let mut request = build_request("/strict");
+        request.method = "POST".to_string();
+        request
+            .headers
+            .insert("Content-Type".to_string(), "application/json".to_string());
+        request
+            .headers
+            .insert("X-Trace-Id".to_string(), "trace-1".to_string());
+        request.body = Some("A".repeat(2048));
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Block);
+        assert_eq!(decision.reason, DecisionReason::BodyTooLarge);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_blocks_when_query_param_limit_is_exceeded() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let mut request = build_request("/strict");
+        request.method = "POST".to_string();
+        request
+            .headers
+            .insert("Content-Type".to_string(), "application/json".to_string());
+        request
+            .headers
+            .insert("X-Trace-Id".to_string(), "trace-2".to_string());
+        request.query = Some("a=1&b=2&c=3".to_string());
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Block);
+        assert_eq!(decision.reason, DecisionReason::TooManyParams);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_blocks_on_signature_match_in_active_mode() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let mut request = build_request("/no-policy");
+        request.query = Some("q=' union select password from users".to_string());
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Block);
+        assert_eq!(decision.reason, DecisionReason::SignatureMatch);
+        assert_eq!(decision.matched_rule_id.as_deref(), Some("942100"));
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_converts_signature_block_to_log_in_passive_mode() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Passive, true).await?;
+        let mut request = build_request("/no-policy");
+        request.body = Some("<script>alert(1)</script>".to_string());
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Log);
+        assert_eq!(decision.reason, DecisionReason::SignatureMatch);
+        assert_eq!(decision.matched_rule_id.as_deref(), Some("941220"));
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_allows_clean_request() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let request = build_request("/no-policy");
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.reason, DecisionReason::Passed);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+}

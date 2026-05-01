@@ -11,7 +11,10 @@ use axum::{
     body::{to_bytes, Body},
     extract::{ConnectInfo, Request, State},
     http::{
-        header::{HeaderName, HOST},
+        header::{
+            HeaderName, CONTENT_SECURITY_POLICY, HOST, SET_COOKIE, STRICT_TRANSPORT_SECURITY,
+            X_FRAME_OPTIONS,
+        },
         HeaderMap, HeaderValue, Response, StatusCode, Uri,
     },
     response::IntoResponse,
@@ -129,10 +132,11 @@ async fn handle_request(
     let body_bytes = to_bytes(body, usize::MAX)
         .await
         .context("failed to read incoming request body")?;
-
+    // Сборка запроса на анализ
     let analysis_request = build_analysis_request(&parts.headers, &method, &uri, &body_bytes, remote_addr);
     let decision = state.analyzer.analyze(&analysis_request).await?;
 
+    //Передача логгеру атак в случае Block илм Log
     if matches!(decision.action, DecisionAction::Block | DecisionAction::Log) {
         state
             .attack_logger
@@ -147,7 +151,7 @@ async fn handle_request(
             })
             .await;
     }
-
+    // Блокировка в случае Block
     if decision.action == DecisionAction::Block {
         info!(
             source_ip = %analysis_request.source_ip,
@@ -186,7 +190,7 @@ async fn forward_request(
     };
     let upstream_url = build_upstream_url(&target_base_url, &uri)?;
     let forwarded_headers = build_forward_headers(headers, &uri, source_ip)?;
-
+    //ответ от целевого сервера
     let upstream_response = state
         .client
         .request(method, upstream_url)
@@ -195,14 +199,15 @@ async fn forward_request(
         .send()
         .await
         .context("failed to send request to upstream")?;
-
+    //разбор ответа по частям
     let status = upstream_response.status();
-    let response_headers = filter_response_headers(upstream_response.headers());
+    let mut response_headers = filter_response_headers(upstream_response.headers());
+    inject_security_headers(&mut response_headers)?;
     let response_body = upstream_response
         .bytes()
         .await
         .context("failed to read upstream response body")?;
-
+    //пересборка и отпрака клиенту
     let mut response_builder = Response::builder().status(status);
     for (name, value) in &response_headers {
         response_builder = response_builder.header(name, value);
@@ -277,17 +282,77 @@ fn append_forwarded_for(
 
     Ok(())
 }
-
+//удаляем hop-by-hop заголовки
 fn filter_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
     let mut filtered = HeaderMap::new();
 
     for (name, value) in headers {
         if !is_hop_by_hop_header(name) {
-            filtered.insert(name.clone(), value.clone());
+            filtered.append(name.clone(), value.clone());
         }
     }
 
     filtered
+}
+
+fn inject_security_headers(headers: &mut HeaderMap) -> Result<()> {
+    headers.insert(
+        STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none';"),
+    );
+
+    harden_set_cookie_headers(headers)?;
+
+    Ok(())
+}
+
+fn harden_set_cookie_headers(headers: &mut HeaderMap) -> Result<()> {
+    let existing_cookies: Vec<HeaderValue> = headers.get_all(SET_COOKIE).iter().cloned().collect();
+    if existing_cookies.is_empty() {
+        return Ok(());
+    }
+
+    let mut hardened_cookies = Vec::with_capacity(existing_cookies.len());
+    for cookie_value in existing_cookies {
+        let hardened_cookie = match cookie_value.to_str() {
+            Ok(cookie_str) => {
+                let mut updated_cookie = cookie_str.to_string();
+                let normalized_cookie = cookie_str.to_ascii_lowercase();
+
+                if !normalized_cookie.contains("; secure") && !normalized_cookie.ends_with(" secure")
+                {
+                    updated_cookie.push_str("; Secure");
+                }
+                if !normalized_cookie.contains("; samesite=")
+                    && !normalized_cookie.ends_with(" samesite")
+                {
+                    updated_cookie.push_str("; SameSite=Lax");
+                }
+
+                HeaderValue::from_str(&updated_cookie).with_context(|| {
+                    format!(
+                        "failed to build hardened Set-Cookie header '{}'",
+                        updated_cookie
+                    )
+                })?
+            }
+            Err(_) => cookie_value,
+        };
+
+        hardened_cookies.push(hardened_cookie);
+    }
+
+    headers.remove(SET_COOKIE);
+    for cookie in hardened_cookies {
+        headers.append(SET_COOKIE, cookie);
+    }
+
+    Ok(())
 }
 
 fn is_hop_by_hop_header(name: &HeaderName) -> bool {
@@ -312,7 +377,7 @@ fn resolve_runtime_path(path: &str) -> PathBuf {
 
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(candidate)
 }
-
+////?????
 fn build_analysis_request(
     headers: &HeaderMap,
     method: &axum::http::Method,
@@ -357,4 +422,73 @@ fn build_attack_payload(request: &AnalysisRequest, message: &str) -> Result<Stri
         "body": request.body,
     }))
     .context("failed to serialize attack payload")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_response_headers_preserves_multiple_set_cookie_headers() {
+        let mut upstream_headers = reqwest::header::HeaderMap::new();
+        upstream_headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("session=abc; Path=/; HttpOnly"),
+        );
+        upstream_headers.append(SET_COOKIE, HeaderValue::from_static("theme=dark; Path=/"));
+
+        let filtered = filter_response_headers(&upstream_headers);
+        let cookies: Vec<_> = filtered.get_all(SET_COOKIE).iter().collect();
+
+        assert_eq!(cookies.len(), 2);
+    }
+
+    #[test]
+    fn inject_security_headers_adds_gateway_headers() {
+        let mut headers = HeaderMap::new();
+
+        inject_security_headers(&mut headers).expect("security header injection should succeed");
+
+        assert_eq!(
+            headers.get(STRICT_TRANSPORT_SECURITY).and_then(|v| v.to_str().ok()),
+            Some("max-age=31536000; includeSubDomains")
+        );
+        assert_eq!(
+            headers.get(X_FRAME_OPTIONS).and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+        assert_eq!(
+            headers
+                .get(CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("frame-ancestors 'none';")
+        );
+    }
+
+    #[test]
+    fn harden_set_cookie_headers_appends_missing_attributes() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("session=abc; Path=/; HttpOnly"),
+        );
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("prefs=1; Path=/; Secure; SameSite=Strict"),
+        );
+
+        harden_set_cookie_headers(&mut headers).expect("cookie hardening should succeed");
+
+        let cookies: Vec<String> = headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies[0].contains("; Secure"));
+        assert!(cookies[0].contains("; SameSite=Lax"));
+        assert!(cookies[1].contains("; Secure"));
+        assert!(cookies[1].contains("SameSite=Strict"));
+    }
 }
