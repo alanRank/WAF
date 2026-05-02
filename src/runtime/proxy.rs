@@ -13,7 +13,7 @@ use axum::{
     http::{
         header::{
             HeaderName, CONTENT_SECURITY_POLICY, HOST, SET_COOKIE, STRICT_TRANSPORT_SECURITY,
-            X_FRAME_OPTIONS,
+            X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
         },
         HeaderMap, HeaderValue, Response, StatusCode, Uri,
     },
@@ -301,9 +301,12 @@ fn inject_security_headers(headers: &mut HeaderMap) -> Result<()> {
         HeaderValue::from_static("max-age=31536000; includeSubDomains"),
     );
     headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(
         CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("frame-ancestors 'none';"),
+        HeaderValue::from_static(
+            "default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';",
+        ),
     );
 
     harden_set_cookie_headers(headers)?;
@@ -459,9 +462,17 @@ mod tests {
         );
         assert_eq!(
             headers
+                .get(X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            headers
                 .get(CONTENT_SECURITY_POLICY)
                 .and_then(|v| v.to_str().ok()),
-            Some("frame-ancestors 'none';")
+            Some(
+                "default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
+            )
         );
     }
 
