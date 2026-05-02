@@ -12,8 +12,8 @@ use axum::{
     extract::{ConnectInfo, Request, State},
     http::{
         header::{
-            HeaderName, CONTENT_SECURITY_POLICY, HOST, SET_COOKIE, STRICT_TRANSPORT_SECURITY,
-            X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+            HeaderName, ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_SECURITY_POLICY, HOST, SET_COOKIE,
+            STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
         },
         HeaderMap, HeaderValue, Response, StatusCode, Uri,
     },
@@ -303,9 +303,13 @@ fn inject_security_headers(headers: &mut HeaderMap) -> Result<()> {
     headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(
+        ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("https://waf.local"),
+    );
+    headers.insert(
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';",
+            "default-src 'self'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';",
         ),
     );
 
@@ -468,10 +472,16 @@ mod tests {
         );
         assert_eq!(
             headers
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://waf.local")
+        );
+        assert_eq!(
+            headers
                 .get(CONTENT_SECURITY_POLICY)
                 .and_then(|v| v.to_str().ok()),
             Some(
-                "default-src 'self'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
+                "default-src 'self'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
             )
         );
     }
