@@ -1,8 +1,8 @@
 use crate::{
     core::{
         config::{
-            load_rules_from_value, load_security_policies_from_value, save_config, save_rules,
-            save_security_policies, AppFiles, SharedState,
+            apply_runtime_env_overrides, load_rules_from_value, load_security_policies_from_value,
+            save_config, save_rules, save_security_policies, AppFiles, SharedState,
         },
         db::Database,
         models::{
@@ -23,7 +23,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use chrono::{Duration, Utc};
@@ -44,7 +44,7 @@ pub struct AdminApiState {
 
 pub async fn run_admin_api(state: AdminApiState) -> Result<()> {
     let config = state.shared_state.config.read().await.clone();
-    let address: SocketAddr = format!("127.0.0.1:{}", config.admin_port)
+    let address: SocketAddr = format!("0.0.0.0:{}", config.admin_port)
         .parse()
         .with_context(|| format!("failed to parse admin bind port '{}'", config.admin_port))?;
 
@@ -132,8 +132,10 @@ async fn update_config(
 ) -> Result<Json<Config>, ApiError> {
     crate::core::config::load_config_from_value(&new_config).map_err(ApiError::bad_request)?;
     save_config(&state.files.config_path, &new_config).map_err(ApiError::internal)?;
-    *state.shared_state.config.write().await = new_config.clone();
-    Ok(Json(new_config))
+    let mut effective_config = new_config.clone();
+    apply_runtime_env_overrides(&mut effective_config).map_err(ApiError::bad_request)?;
+    *state.shared_state.config.write().await = effective_config.clone();
+    Ok(Json(effective_config))
 }
 
 async fn get_rules(State(state): State<AdminApiState>) -> Result<Json<Vec<Rule>>, ApiError> {

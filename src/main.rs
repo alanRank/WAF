@@ -5,7 +5,7 @@ mod runtime;
 use crate::api::admin::{ensure_default_admin_user, run_admin_api, AdminApiState};
 use crate::core::{
     analyzer::Analyzer,
-    config::{load_shared_state, AppFiles},
+    config::{load_shared_state, resolve_app_files},
     db::Database,
     logger::AttackLogger,
     models::{AccessListType, AnalysisRequest, NewIpAccessEntry},
@@ -14,7 +14,6 @@ use crate::runtime::proxy::run_interceptor;
 use anyhow::{Context, Result};
 use rustls::crypto::ring::default_provider;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -24,10 +23,14 @@ async fn main() -> Result<()> {
     init_tracing();
     install_rustls_crypto_provider()?;
 
-    let files = AppFiles::new(resolve_data_dir()?);
-    ensure_data_directory_exists(&files)?;
+    let files = resolve_app_files()?;
+    ensure_runtime_directories_exist(&files)?;
 
-    info!(data_dir = %files.data_dir.display(), "resolved data directory");
+    info!(
+        config_dir = %files.config_dir.display(),
+        db_dir = %files.db_dir.display(),
+        "resolved runtime directories"
+    );
 
     let database = Database::connect(&files.db_path).await?;
     database.initialize().await?;
@@ -104,63 +107,22 @@ fn init_tracing() {
         .init();
 }
 
-fn ensure_data_directory_exists(files: &AppFiles) -> Result<()> {
-    std::fs::create_dir_all(&files.data_dir).with_context(|| {
+fn ensure_runtime_directories_exist(files: &crate::core::config::AppFiles) -> Result<()> {
+    std::fs::create_dir_all(&files.config_dir).with_context(|| {
         format!(
-            "failed to create or access data directory '{}'",
-            files.data_dir.display()
+            "failed to create or access config directory '{}'",
+            files.config_dir.display()
+        )
+    })?;
+
+    std::fs::create_dir_all(&files.db_dir).with_context(|| {
+        format!(
+            "failed to create or access database directory '{}'",
+            files.db_dir.display()
         )
     })?;
 
     Ok(())
-}
-
-fn resolve_data_dir() -> Result<PathBuf> {
-    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data");
-    if has_required_data_files(&manifest_candidate) {
-        return manifest_candidate.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize manifest data directory '{}'",
-                manifest_candidate.display()
-            )
-        });
-    }
-
-    let cwd_candidate = PathBuf::from("data");
-    if has_required_data_files(&cwd_candidate) {
-        return cwd_candidate.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize cwd data directory '{}'",
-                cwd_candidate.display()
-            )
-        });
-    }
-
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(project_dir) = exe_path.ancestors().nth(3) {
-            let exe_candidate = project_dir.join("data");
-            if has_required_data_files(&exe_candidate) {
-                return exe_candidate.canonicalize().with_context(|| {
-                    format!(
-                        "failed to canonicalize executable-relative data directory '{}'",
-                        exe_candidate.display()
-                    )
-                });
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "data directory was not found in '{}', '{}' or near executable",
-        cwd_candidate.display(),
-        manifest_candidate.display()
-    );
-}
-
-fn has_required_data_files(dir: &std::path::Path) -> bool {
-    dir.join("config.json").is_file()
-        && dir.join("rules.json").is_file()
-        && dir.join("sec_policies.json").is_file()
 }
 
 async fn seed_demo_ip_data(database: &Database) -> Result<()> {

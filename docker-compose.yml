@@ -1,0 +1,49 @@
+name: rust-waf
+
+services:
+  waf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rust-waf
+    depends_on:
+      - juice-shop
+    environment:
+      WAF_MODE: ${WAF_MODE:-active}
+      TARGET_URL: ${TARGET_URL:-http://juice-shop:3000}
+      ADMIN_PORT: ${ADMIN_PORT:-8081}
+      TLS_PRIVATE: ${TLS_PRIVATE:-/etc/ssl/private/waf.local-key.pem}
+      TLS_PUBLIC: ${TLS_PUBLIC:-/etc/ssl/certs/waf.local.pem}
+      WAF_CONFIG_PATH: /app/config/config.json
+      WAF_RULES_PATH: /app/config/rules.json
+      WAF_SEC_POLICIES_PATH: /app/config/sec_policies.json
+      WAF_DB_PATH: /var/lib/rust-waf/waf.db
+    ports:
+      - "443:443"
+      - "${ADMIN_PORT:-8081}:${ADMIN_PORT:-8081}"
+    volumes:
+      - waf-db:/var/lib/rust-waf
+      - ./data/config.json:/app/config/config.json
+      - ./data/rules.json:/app/config/rules.json
+      - ./data/sec_policies.json:/app/config/sec_policies.json
+      - ./data/certs/waf.local-key.pem:/etc/ssl/private/waf.local-key.pem:ro
+      - ./data/certs/waf.local.pem:/etc/ssl/certs/waf.local.pem:ro
+    networks:
+      - public
+      - waf-internal
+
+  juice-shop:
+    image: bkimminich/juice-shop
+    container_name: juice-shop
+    networks:
+      - waf-internal
+
+networks:
+  public:
+    driver: bridge
+  waf-internal:
+    driver: bridge
+    internal: true
+
+volumes:
+  waf-db:
