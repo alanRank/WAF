@@ -1,4 +1,4 @@
-use crate::core::models::{Config, Rule, SecurityPolicies};
+use crate::core::models::{CompiledRule, Config, Rule, SecurityPolicies};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::{
@@ -14,6 +14,7 @@ use url::Url;
 pub struct SharedState {
     pub config: Arc<RwLock<Config>>,
     pub rules: Arc<RwLock<Vec<Rule>>>,
+    pub compiled_rules: Arc<RwLock<Vec<CompiledRule>>>,
     pub security_policies: Arc<RwLock<SecurityPolicies>>,
 }
 
@@ -31,11 +32,13 @@ pub fn load_shared_state(files: &AppFiles) -> Result<SharedState> {
     let mut config = load_config(&files.config_path)?;
     apply_runtime_env_overrides(&mut config)?;
     let rules = load_rules(&files.rules_path)?;
+    let compiled_rules = compile_rules(&rules)?;
     let security_policies = load_security_policies(&files.security_policies_path)?;
 
     Ok(SharedState {
         config: Arc::new(RwLock::new(config)),
         rules: Arc::new(RwLock::new(rules)),
+        compiled_rules: Arc::new(RwLock::new(compiled_rules)),
         security_policies: Arc::new(RwLock::new(security_policies)),
     })
 }
@@ -119,6 +122,23 @@ pub fn apply_runtime_env_overrides(config: &mut Config) -> Result<()> {
 
 pub fn load_rules_from_value(rules: &[Rule]) -> Result<()> {
     validate_rules(rules)
+}
+
+pub fn compile_rules(rules: &[Rule]) -> Result<Vec<CompiledRule>> {
+    validate_rules(rules)?;
+
+    rules
+        .iter()
+        .map(|rule| {
+            Ok(CompiledRule {
+                id: rule.id.clone(),
+                name: rule.name.clone(),
+                severity: rule.severity.clone(),
+                regex: Regex::new(&rule.regex)
+                    .with_context(|| format!("invalid regex for rule '{}'", rule.id))?,
+            })
+        })
+        .collect()
 }
 
 pub fn load_security_policies_from_value(_policies: &SecurityPolicies) -> Result<()> {

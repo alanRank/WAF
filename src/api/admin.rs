@@ -1,8 +1,9 @@
 use crate::{
     core::{
         config::{
-            apply_runtime_env_overrides, load_rules_from_value, load_security_policies_from_value,
-            save_config, save_rules, save_security_policies, AppFiles, SharedState,
+            apply_runtime_env_overrides, compile_rules, load_rules_from_value,
+            load_security_policies_from_value, save_config, save_rules, save_security_policies,
+            AppFiles, SharedState,
         },
         db::Database,
         models::{
@@ -147,8 +148,10 @@ async fn update_rules(
     Json(new_rules): Json<Vec<Rule>>,
 ) -> Result<Json<Vec<Rule>>, ApiError> {
     load_rules_from_value(&new_rules).map_err(ApiError::bad_request)?;
+    let compiled_rules = compile_rules(&new_rules).map_err(ApiError::bad_request)?;
     save_rules(&state.files.rules_path, &new_rules).map_err(ApiError::internal)?;
     *state.shared_state.rules.write().await = new_rules.clone();
+    *state.shared_state.compiled_rules.write().await = compiled_rules;
     Ok(Json(new_rules))
 }
 

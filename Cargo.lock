@@ -1579,6 +1579,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-server",
+ "base64",
  "chrono",
  "jsonwebtoken",
  "regex",

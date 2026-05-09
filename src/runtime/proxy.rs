@@ -153,12 +153,15 @@ async fn handle_request(
     }
     // Блокировка в случае Block
     if decision.action == DecisionAction::Block {
+        let request_preview = build_blocked_request_preview(&analysis_request)?;
+
         info!(
             source_ip = %analysis_request.source_ip,
             path = %analysis_request.path,
             reason = ?decision.reason,
             matched_rule_id = ?decision.matched_rule_id,
             message = %decision.message,
+            request = %request_preview,
             "request blocked by analyzer"
         );
 
@@ -431,6 +434,41 @@ fn build_attack_payload(request: &AnalysisRequest, message: &str) -> Result<Stri
     .context("failed to serialize attack payload")
 }
 
+fn build_blocked_request_preview(request: &AnalysisRequest) -> Result<String> {
+    let headers = request
+        .headers
+        .iter()
+        .map(|(name, value)| (name.clone(), truncate_preview(value, 256)))
+        .collect::<Vec<_>>();
+
+    serde_json::to_string(&serde_json::json!({
+        "method": request.method,
+        "path": request.path,
+        "query": request.query,
+        "headers": headers,
+        "body": request.body.as_ref().map(|body| truncate_preview(body, 1024)),
+    }))
+    .context("failed to serialize blocked request preview")
+}
+
+fn truncate_preview(value: &str, max_len: usize) -> String {
+    let mut truncated = String::new();
+    let mut chars = value.chars();
+
+    for _ in 0..max_len {
+        match chars.next() {
+            Some(ch) => truncated.push(ch),
+            None => return truncated,
+        }
+    }
+
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +549,32 @@ mod tests {
         assert!(cookies[0].contains("; SameSite=Lax"));
         assert!(cookies[1].contains("; Secure"));
         assert!(cookies[1].contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn blocked_request_preview_includes_request_parts_and_truncates_body() {
+        let request = AnalysisRequest {
+            source_ip: "127.0.0.1".to_string(),
+            method: "POST".to_string(),
+            path: "/login".to_string(),
+            query: Some("return=/admin".to_string()),
+            headers: [
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-auth-token".to_string(), "abc123".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            body: Some("x".repeat(1100)),
+        };
+
+        let preview = build_blocked_request_preview(&request)
+            .expect("request preview serialization should succeed");
+
+        assert!(preview.contains("\"method\":\"POST\""));
+        assert!(preview.contains("\"path\":\"/login\""));
+        assert!(preview.contains("\"query\":\"return=/admin\""));
+        assert!(preview.contains("\"content-type\",\"application/json\""));
+        assert!(preview.contains("\"x-auth-token\",\"abc123\""));
+        assert!(preview.contains("..."));
     }
 }

@@ -3,13 +3,13 @@ use crate::{
         config::SharedState,
         db::Database,
         models::{
-            AnalysisDecision, AnalysisRequest, DecisionAction, DecisionReason, EndpointPolicy,
-            SecurityPolicies, WafMode,
+            AnalysisDecision, AnalysisRequest, CompiledRule, DecisionAction, DecisionReason,
+            EndpointPolicy, NormalizedRequest, SecurityPolicies, WafMode,
         },
     },
 };
-use anyhow::{Context, Result};
-use regex::Regex;
+use anyhow::Result;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -191,19 +191,19 @@ impl Analyzer {
     }
 
     async fn check_signatures(&self, request: &AnalysisRequest) -> Result<Option<AnalysisDecision>> {
-        let rules = self.state.rules.read().await.clone();
-        let inspect_target = build_inspection_target(request);
+        let rules = self.state.compiled_rules.read().await.clone();
+        let normalized_request = normalize_request(request);
 
         for rule in rules {
-            let regex = Regex::new(&rule.regex)
-                .with_context(|| format!("failed to compile regex for rule '{}'", rule.id))?;
-
-            if regex.is_match(&inspect_target) {
+            if let Some(component) = match_rule_against_request(&rule, &normalized_request) {
                 return Ok(Some(AnalysisDecision {
                     action: DecisionAction::Block,
                     reason: DecisionReason::SignatureMatch,
                     matched_rule_id: Some(rule.id.clone()),
-                    message: format!("request matched signature '{}: {}'", rule.id, rule.name),
+                    message: format!(
+                        "request matched signature '{}: {}' in {}",
+                        rule.id, rule.name, component
+                    ),
                 }));
             }
         }
@@ -226,6 +226,281 @@ impl Analyzer {
             },
         }
     }
+}
+
+fn match_rule_against_request<'a>(
+    rule: &'a CompiledRule,
+    request: &'a NormalizedRequest,
+) -> Option<&'static str> {
+    let _severity = &rule.severity;
+
+    if rule.regex.is_match(&request.path) {
+        return Some("path");
+    }
+
+    if request
+        .query
+        .as_deref()
+        .is_some_and(|query| rule.regex.is_match(query))
+    {
+        return Some("query");
+    }
+
+    for (header_name, header_values) in &request.headers {
+        if !should_inspect_header_for_signatures(header_name) {
+            continue;
+        }
+
+        if rule.regex.is_match(header_name) {
+            return Some("header-name");
+        }
+
+        if header_values.iter().any(|value| rule.regex.is_match(value)) {
+            return Some("header-value");
+        }
+    }
+
+    if request.body.iter().any(|body| rule.regex.is_match(body)) {
+        return Some("body");
+    }
+
+    None
+}
+
+fn normalize_request(request: &AnalysisRequest) -> NormalizedRequest {
+    NormalizedRequest {
+        path: normalize_path_or_query(&request.path),
+        query: request.query.as_deref().map(normalize_path_or_query),
+        headers: normalize_signature_headers(&request.headers),
+        body: request
+            .body
+            .as_deref()
+            .map(normalize_body)
+            .unwrap_or_default(),
+    }
+}
+
+fn normalize_path_or_query(input: &str) -> String {
+    recursive_url_decode(input, 3).to_ascii_lowercase()
+}
+
+fn normalize_signature_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, Vec<String>> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let normalized_name = normalize_header_name(name);
+            let normalized_values = normalize_header_value(&normalized_name, value);
+            (normalized_name, normalized_values)
+        })
+        .collect()
+}
+
+fn normalize_header_value(name: &str, value: &str) -> Vec<String> {
+    let mut variants = vec![normalize_header_text(value)];
+
+    if should_attempt_base64_decode(name) {
+        for candidate in extract_base64_candidates(value) {
+            if let Some(decoded) = decode_base64_text(&candidate) {
+                variants.push(normalize_header_text(&decoded));
+            }
+        }
+    }
+
+    dedup_non_empty(variants)
+}
+
+fn normalize_body(input: &str) -> Vec<String> {
+    let url_decoded = recursive_url_decode(input, 3);
+    let mut variants = vec![normalize_body_text(&url_decoded)];
+
+    if let Some(decoded) = decode_base64_text(url_decoded.trim()) {
+        variants.push(normalize_body_text(&decoded));
+    }
+
+    dedup_non_empty(variants)
+}
+
+fn normalize_body_text(input: &str) -> String {
+    let html_decoded = decode_html_entities(input);
+    normalize_text(&html_decoded)
+}
+
+fn normalize_header_text(input: &str) -> String {
+    normalize_text(input)
+}
+
+fn normalize_text(input: &str) -> String {
+    collapse_whitespace(&input.to_ascii_lowercase())
+}
+
+fn recursive_url_decode(input: &str, max_passes: usize) -> String {
+    let mut current = input.to_string();
+
+    for _ in 0..max_passes {
+        let decoded = url_decode_once(&current);
+        if decoded == current {
+            break;
+        }
+        current = decoded;
+    }
+
+    current
+}
+
+fn url_decode_once(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) = (
+                    hex_value(bytes[index + 1]),
+                    hex_value(bytes[index + 2]),
+                ) {
+                    output.push((high << 4) | low);
+                    index += 3;
+                    continue;
+                }
+                output.push(bytes[index]);
+                index += 1;
+            }
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&output).to_string()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_html_entities(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '&' {
+            let relative_end = chars[index + 1..].iter().position(|ch| *ch == ';');
+            if let Some(relative_end) = relative_end {
+                let end = index + 1 + relative_end;
+                let entity: String = chars[index + 1..end].iter().collect();
+                if let Some(decoded) = decode_single_html_entity(&entity) {
+                    output.push(decoded);
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        output.push(chars[index]);
+        index += 1;
+    }
+
+    output
+}
+
+fn decode_single_html_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+            u32::from_str_radix(&entity[2..], 16)
+                .ok()
+                .and_then(char::from_u32)
+        }
+        _ if entity.starts_with('#') => entity[1..].parse::<u32>().ok().and_then(char::from_u32),
+        _ => None,
+    }
+}
+
+fn should_attempt_base64_decode(header_name: &str) -> bool {
+    matches!(header_name, "authorization")
+        || header_name.contains("token")
+        || header_name.contains("auth")
+        || header_name.contains("secret")
+}
+
+fn should_inspect_header_for_signatures(header_name: &str) -> bool {
+    matches!(
+        header_name,
+        "authorization" | "origin" | "referer" | "x-requested-with"
+    ) || header_name.starts_with("x-")
+}
+
+fn extract_base64_candidates(input: &str) -> Vec<String> {
+    let trimmed = input.trim();
+    let mut candidates = vec![trimmed.to_string()];
+
+    if let Some(last_token) = trimmed.split_whitespace().last() {
+        if last_token != trimmed {
+            candidates.push(last_token.to_string());
+        }
+    }
+
+    dedup_non_empty(candidates)
+}
+
+fn decode_base64_text(input: &str) -> Option<String> {
+    let candidate = input.trim();
+    if !looks_like_base64(candidate) {
+        return None;
+    }
+
+    let decoded = STANDARD.decode(candidate).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    Some(text)
+}
+
+fn looks_like_base64(input: &str) -> bool {
+    let candidate = input.trim();
+    candidate.len() >= 8
+        && candidate.len() % 4 == 0
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn dedup_non_empty(items: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
+
+    for item in items {
+        if item.trim().is_empty() {
+            continue;
+        }
+        if !unique.contains(&item) {
+            unique.push(item);
+        }
+    }
+
+    unique
 }
 
 fn find_endpoint_policy<'a>(
@@ -273,21 +548,11 @@ fn count_query_params(query: Option<&str>) -> usize {
     })
 }
 
-fn build_inspection_target(request: &AnalysisRequest) -> String {
-    format!(
-        "{}\n{}\n{}\n{}",
-        request.method,
-        request.path,
-        request.query.as_deref().unwrap_or_default(),
-        request.body.as_deref().unwrap_or_default()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::{
-        config::SharedState,
+        config::{compile_rules, SharedState},
         models::{
             AccessListType, Config, GlobalDefaults, NewIpAccessEntry, Rule, Severity,
         },
@@ -319,7 +584,7 @@ mod tests {
             Rule {
                 id: "942100".to_string(),
                 name: "SQL Injection Attack".to_string(),
-                regex: "(?i)(union\\s+select|or\\s+1=1)".to_string(),
+                regex: "(?i)(union\\s+select|or\\s+1=1|select)".to_string(),
                 severity: Severity::High,
             },
             Rule {
@@ -388,10 +653,13 @@ mod tests {
         let db_path = unique_test_db_path();
         let db = Database::connect(&db_path).await?;
         db.initialize().await?;
+        let rules = test_rules();
+        let compiled_rules = compile_rules(&rules)?;
 
         let state = SharedState {
             config: Arc::new(RwLock::new(test_config(mode, is_enabled))),
-            rules: Arc::new(RwLock::new(test_rules())),
+            rules: Arc::new(RwLock::new(rules)),
+            compiled_rules: Arc::new(RwLock::new(compiled_rules)),
             security_policies: Arc::new(RwLock::new(test_policies())),
         };
 
@@ -449,22 +717,51 @@ mod tests {
     }
 
     #[test]
-    fn build_inspection_target_includes_method_path_query_and_body() {
+    fn recursive_url_decode_unwraps_multiple_layers() {
+        assert_eq!(recursive_url_decode("%2527", 3), "'");
+    }
+
+    #[test]
+    fn decode_html_entities_supports_named_and_numeric_values() {
+        assert_eq!(decode_html_entities("S&#69;L&#x45;CT &lt;x&gt;"), "SELECT <x>");
+    }
+
+    #[test]
+    fn normalize_body_decodes_base64_payloads() {
+        let normalized = normalize_body("U0VMRUNU");
+        assert!(normalized.iter().any(|value| value.contains("select")));
+    }
+
+    #[test]
+    fn normalize_request_keeps_components_separate() {
         let request = AnalysisRequest {
             source_ip: "127.0.0.1".to_string(),
             method: "POST".to_string(),
-            path: "/login".to_string(),
-            query: Some("q=test".to_string()),
-            headers: BTreeMap::new(),
-            body: Some("<script>alert(1)</script>".to_string()),
+            path: "/REST/%2550roducts".to_string(),
+            query: Some("q=%2527%2520UNION%2520SELECT".to_string()),
+            headers: BTreeMap::from([("X-Token".to_string(), "U0VMRUNU".to_string())]),
+            body: Some("S&#69;L&#x45;CT".to_string()),
         };
 
-        let target = build_inspection_target(&request);
+        let normalized = normalize_request(&request);
 
-        assert!(target.contains("POST"));
-        assert!(target.contains("/login"));
-        assert!(target.contains("q=test"));
-        assert!(target.contains("<script>alert(1)</script>"));
+        assert_eq!(normalized.path, "/rest/products");
+        assert_eq!(normalized.query.as_deref(), Some("q=' union select"));
+        assert!(normalized
+            .headers
+            .get("x-token")
+            .is_some_and(|values| values.iter().any(|value| value.contains("select"))));
+        assert!(normalized.body.iter().any(|value| value.contains("select")));
+    }
+
+    #[test]
+    fn generic_browser_headers_are_not_signature_targets() {
+        assert!(!should_inspect_header_for_signatures("user-agent"));
+        assert!(!should_inspect_header_for_signatures("accept"));
+        assert!(!should_inspect_header_for_signatures("sec-fetch-dest"));
+        assert!(!should_inspect_header_for_signatures("cookie"));
+        assert!(should_inspect_header_for_signatures("authorization"));
+        assert!(should_inspect_header_for_signatures("x-auth-token"));
     }
 
     #[tokio::test]
@@ -692,7 +989,43 @@ mod tests {
     async fn analyze_blocks_on_signature_match_in_active_mode() -> Result<()> {
         let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
         let mut request = build_request("/no-policy");
-        request.query = Some("q=' union select password from users".to_string());
+        request.query = Some("q=%2527%2520UNION%2520SELECT".to_string());
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Block);
+        assert_eq!(decision.reason, DecisionReason::SignatureMatch);
+        assert_eq!(decision.matched_rule_id.as_deref(), Some("942100"));
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_detects_html_entity_obfuscated_payload_in_body() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let mut request = build_request("/no-policy");
+        request.body = Some("S&#69;L&#x45;CT".to_string());
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Block);
+        assert_eq!(decision.reason, DecisionReason::SignatureMatch);
+        assert_eq!(decision.matched_rule_id.as_deref(), Some("942100"));
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_detects_base64_payload_in_header() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let mut request = build_request("/no-policy");
+        request
+            .headers
+            .insert("X-Auth-Token".to_string(), "U0VMRUNU".to_string());
 
         let decision = analyzer.analyze(&request).await?;
 
@@ -726,6 +1059,66 @@ mod tests {
     async fn analyze_allows_clean_request() -> Result<()> {
         let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
         let request = build_request("/no-policy");
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.reason, DecisionReason::Passed);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_allows_typical_browser_asset_request() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let request = AnalysisRequest {
+            source_ip: "172.19.0.1".to_string(),
+            method: "GET".to_string(),
+            path: "/favicon.ico".to_string(),
+            query: None,
+            headers: BTreeMap::from([
+                ("User-Agent".to_string(), "Mozilla/5.0".to_string()),
+                ("Accept".to_string(), "image/avif,image/webp,image/*,*/*;q=0.8".to_string()),
+                (
+                    "Cookie".to_string(),
+                    "continueCode=O3VMEvaDgyX8LvJ4qo7EwW6m29xP0pOGzRkZKY1bB3MNjOVprl5QenrK4a2x"
+                        .to_string(),
+                ),
+                ("Sec-Fetch-Site".to_string(), "same-origin".to_string()),
+                ("Sec-Fetch-Mode".to_string(), "no-cors".to_string()),
+                ("Sec-Fetch-Dest".to_string(), "image".to_string()),
+                ("Upgrade-Insecure-Requests".to_string(), "1".to_string()),
+            ]),
+            body: None,
+        };
+
+        let decision = analyzer.analyze(&request).await?;
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.reason, DecisionReason::Passed);
+
+        drop(analyzer);
+        cleanup_db(db_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analyze_does_not_treat_cookie_key_names_as_xss_event_handlers() -> Result<()> {
+        let (analyzer, db_path) = build_analyzer(WafMode::Active, true).await?;
+        let request = AnalysisRequest {
+            source_ip: "127.0.0.1".to_string(),
+            method: "GET".to_string(),
+            path: "/favicon.ico".to_string(),
+            query: None,
+            headers: BTreeMap::from([(
+                "Cookie".to_string(),
+                "continueCode=O3VMEvaDgyX8LvJ4qo7EwW6m29xP0pOGzRkZKY1bB3MNjOVprl5QenrK4a2x"
+                    .to_string(),
+            )]),
+            body: None,
+        };
 
         let decision = analyzer.analyze(&request).await?;
 

@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::collections::{BTreeMap, HashMap};
@@ -48,6 +49,14 @@ pub struct Rule {
     pub name: String,
     pub regex: String,
     pub severity: Severity,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledRule {
+    pub id: String,
+    pub name: String,
+    pub severity: Severity,
+    pub regex: Regex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +211,14 @@ pub struct AnalysisRequest {
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     pub body: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizedRequest {
+    pub path: String,
+    pub query: Option<String>,
+    pub headers: BTreeMap<String, Vec<String>>,
+    pub body: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
