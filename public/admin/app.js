@@ -1,4 +1,5 @@
 const DASHBOARD_LOG_LIMIT = "all";
+const LOGS_PER_PAGE = 10;
 const TIMELINE_STEP_SECONDS = 10;
 const TIMELINE_BUCKETS = 18;
 const LIVE_REFRESH_MS = 2000;
@@ -10,6 +11,8 @@ const state = {
   rules: [],
   policies: null,
   logs: [],
+  logsPage: 1,
+  logsPageInput: "1",
   ipEntries: [],
   users: [],
   charts: {
@@ -27,6 +30,7 @@ const globalStatus = document.getElementById("global-status");
 
 document.getElementById("login-form").addEventListener("submit", onLogin);
 document.getElementById("refresh-btn").addEventListener("click", refreshAll);
+document.getElementById("report-btn").addEventListener("click", createReport);
 document.getElementById("logout-btn").addEventListener("click", logout);
 document.getElementById("config-form").addEventListener("submit", saveConfig);
 document.getElementById("ip-form").addEventListener("submit", upsertIpEntry);
@@ -356,6 +360,17 @@ async function clearLogs() {
   renderLogs();
   renderDashboard();
   showStatus("Журнал атак очищен", false);
+}
+
+async function createReport() {
+  try {
+    showStatus("Готовлю отчет за последние сутки...", false);
+    await downloadProtectedFile("/api/admin/reports/daily.pdf", "waf-daily-report.pdf");
+    await downloadProtectedFile("/api/admin/reports/daily.json", "waf-daily-logs.json");
+    showStatus("Отчет и JSON-логи за последние сутки загружены", false, true);
+  } catch (error) {
+    showStatus(error.message, true);
+  }
 }
 
 async function deleteLog(id) {
@@ -705,12 +720,44 @@ async function api(url, options = {}) {
   return payload;
 }
 
+async function downloadProtectedFile(url, fallbackName) {
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${state.token}`
+    }
+  });
+
+  if (!response.ok) {
+    const payload = await safeJson(response);
+    throw new Error(payload?.error || `Request failed: ${response.status}`);
+  }
+
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = getFilenameFromDisposition(response.headers.get("content-disposition")) || fallbackName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 async function safeJson(response) {
   try {
     return await response.json();
   } catch {
     return null;
   }
+}
+
+function getFilenameFromDisposition(value) {
+  if (!value) {
+    return null;
+  }
+
+  const match = /filename=\"?([^\";]+)\"?/i.exec(value);
+  return match ? match[1] : null;
 }
 
 function wrapTable(headers, rows) {
@@ -722,6 +769,70 @@ function wrapTable(headers, rows) {
       </table>
     </div>
   `;
+}
+
+function renderLogs() {
+  const totalPages = Math.max(1, Math.ceil(state.logs.length / LOGS_PER_PAGE));
+  if (state.logsPage > totalPages) {
+    state.logsPage = totalPages;
+  }
+  if (!state.logsPageInput) {
+    state.logsPageInput = String(state.logsPage);
+  }
+
+  const startIndex = (state.logsPage - 1) * LOGS_PER_PAGE;
+  const pageLogs = state.logs.slice(startIndex, startIndex + LOGS_PER_PAGE);
+  const rows = pageLogs
+    .map((log) => {
+      const requestUrl = log.request_url || "-";
+      const attackType = log.attack_type || "-";
+      const reason = extractMessage(log.payload);
+
+      return `
+        <tr>
+          <td class="text-xs text-bark/70">${escapeHtml(log.timestamp)}</td>
+          <td class="text-sm" title="${escapeHtml(log.source_ip)}">${escapeHtml(truncateText(log.source_ip, 32))}</td>
+          <td class="text-sm" title="${escapeHtml(requestUrl)}">${escapeHtml(truncateText(requestUrl, 72))}</td>
+          <td class="text-sm" title="${escapeHtml(attackType)}">${escapeHtml(truncateText(attackType, 36))}</td>
+          <td class="text-sm">${escapeHtml(truncateText(log.action_taken, 16))}</td>
+          <td class="text-xs text-bark/70" title="${escapeHtml(reason)}">${escapeHtml(truncateText(reason, 96))}</td>
+          <td class="text-right">
+            <button class="secondary-btn !py-2 !px-3" onclick="deleteLog(${log.id})">РЈРґР°Р»РёС‚СЊ</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  const tableHtml = wrapTable(
+    ["Р’СЂРµРјСЏ", "IP", "URL", "РўРёРї", "Р”РµР№СЃС‚РІРёРµ", "РџСЂРёС‡РёРЅР°", ""],
+    rows || emptyRow("Р›РѕРіРё РѕС‚СЃСѓС‚СЃС‚РІСѓСЋС‚", 7)
+  );
+
+  document.getElementById("logs-table").innerHTML = `${tableHtml}${renderLogsPagination(totalPages)}`;
+}
+
+function renderLogsPagination(totalPages) {
+  if (state.logs.length === 0) {
+    return "";
+  }
+
+  return `
+    <div class="mt-4 flex flex-wrap items-center justify-between gap-3 px-2">
+      <div class="text-sm text-bark/60">Страница ${state.logsPage} из ${totalPages}</div>
+      <div class="flex gap-2">
+        <button class="secondary-btn !py-2 !px-3" onclick="changeLogsPage(-1)" ${state.logsPage === 1 ? "disabled" : ""}>Назад</button>
+        <button class="secondary-btn !py-2 !px-3" onclick="changeLogsPage(1)" ${state.logsPage >= totalPages ? "disabled" : ""}>Вперед</button>
+      </div>
+    </div>
+  `;
+}
+
+function changeLogsPage(delta) {
+  const totalPages = Math.max(1, Math.ceil(state.logs.length / LOGS_PER_PAGE));
+  state.logsPage = Math.min(totalPages, Math.max(1, state.logsPage + delta));
+  state.logsPageInput = String(state.logsPage);
+  renderLogs();
 }
 
 function emptyRow(message, colspan) {
@@ -741,7 +852,108 @@ function escapeJs(value) {
   return String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'");
 }
 
+function truncateText(value, maxLength) {
+  const text = String(value ?? "");
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+function renderLogs() {
+  const totalPages = Math.max(1, Math.ceil(state.logs.length / LOGS_PER_PAGE));
+  if (state.logsPage > totalPages) {
+    state.logsPage = totalPages;
+  }
+
+  const startIndex = (state.logsPage - 1) * LOGS_PER_PAGE;
+  const pageLogs = state.logs.slice(startIndex, startIndex + LOGS_PER_PAGE);
+  const rows = pageLogs
+    .map((log) => {
+      const requestUrl = log.request_url || "-";
+      const attackType = log.attack_type || "-";
+      const reason = extractMessage(log.payload);
+
+      return `
+        <tr>
+          <td class="text-xs text-bark/70">${escapeHtml(log.timestamp)}</td>
+          <td class="text-sm" title="${escapeHtml(log.source_ip)}">${escapeHtml(truncateText(log.source_ip, 32))}</td>
+          <td class="text-sm" title="${escapeHtml(requestUrl)}">${escapeHtml(truncateText(requestUrl, 72))}</td>
+          <td class="text-sm" title="${escapeHtml(attackType)}">${escapeHtml(truncateText(attackType, 36))}</td>
+          <td class="text-sm">${escapeHtml(truncateText(log.action_taken, 16))}</td>
+          <td class="text-xs text-bark/70" title="${escapeHtml(reason)}">${escapeHtml(truncateText(reason, 96))}</td>
+          <td class="text-right">
+            <button class="secondary-btn !py-2 !px-3" onclick="deleteLog(${log.id})">Delete</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  const tableHtml = wrapTable(
+    ["Time", "IP", "URL", "Type", "Action", "Reason", ""],
+    rows || emptyRow("No logs available", 7)
+  );
+
+  document.getElementById("logs-table").innerHTML = `${tableHtml}${renderLogsPagination(totalPages)}`;
+}
+
+function renderLogsPagination(totalPages) {
+  if (state.logs.length === 0) {
+    return "";
+  }
+
+  return `
+    <div class="mt-4 flex flex-wrap items-center justify-between gap-3 px-2">
+      <div class="text-sm text-bark/60">Page ${state.logsPage} of ${totalPages}</div>
+      <div class="flex flex-wrap items-center gap-2">
+        <button
+          class="secondary-btn !py-2 !px-3"
+          onclick="changeLogsPage(-1)"
+          ${state.logsPage === 1 ? "disabled" : ""}
+        >
+          Prev
+        </button>
+        <input
+          id="logs-page-input"
+          class="field !w-20 !px-3 !py-2 text-center"
+          type="number"
+          min="1"
+          max="${totalPages}"
+          value="${escapeHtml(state.logsPageInput)}"
+          oninput="setLogsPageInput(this.value)"
+          onkeyup="if (event.key === 'Enter') { goToLogsPage(this.value); }"
+        />
+        <button
+          class="secondary-btn !py-2 !px-3"
+          onclick="changeLogsPage(1)"
+          ${state.logsPage >= totalPages ? "disabled" : ""}
+        >
+          Next
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function goToLogsPage(page) {
+  const totalPages = Math.max(1, Math.ceil(state.logs.length / LOGS_PER_PAGE));
+  const rawValue = Number.parseInt(page, 10);
+  const targetPage = Number.isFinite(rawValue) ? rawValue : state.logsPage;
+  state.logsPage = Math.min(totalPages, Math.max(1, targetPage));
+  state.logsPageInput = String(state.logsPage);
+  renderLogs();
+}
+
+function setLogsPageInput(value) {
+  state.logsPageInput = value;
+}
+
 window.deleteLog = deleteLog;
 window.deleteIp = deleteIp;
 window.deleteUser = deleteUser;
 window.updateUser = updateUser;
+window.changeLogsPage = changeLogsPage;
+window.goToLogsPage = goToLogsPage;
+window.setLogsPageInput = setLogsPageInput;
